@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import queue
 import socket
-import sys
 import threading
 from collections import deque
 from dataclasses import dataclass
