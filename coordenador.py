@@ -9,7 +9,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, Optional
 
 from protocolo import F, GRANT, REQUEST, RELEASE, criar_mensagem, interpretar_mensagem, nome_tipo, receber_exatamente
 
