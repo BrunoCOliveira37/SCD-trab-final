@@ -30,7 +30,6 @@ class Coordenador:
 		self.eventos: "queue.Queue[Evento]" = queue.Queue()
 		self.lock = threading.Lock()
 		self.fila_pedidos: Deque[int] = deque()
-		self.processo_na_regiao_critica: Optional[int] = None
 		self.sockets_por_pid: Dict[int, socket.socket] = {}
 		self.pid_por_socket: Dict[socket.socket, int] = {}
 		self.quantidade_atendimentos: Dict[int, int] = {}
@@ -123,20 +122,23 @@ class Coordenador:
 			self._remover_conexao(conexao)
 
 	def _remover_conexao(self, conexao: socket.socket) -> None:
+		deve_atender = False
 		with self.lock:
 			pid = self.pid_por_socket.pop(conexao, None)
 			if pid is not None:
 				self.sockets_por_pid.pop(pid, None)
 				try:
+					era_primeiro = bool(self.fila_pedidos) and self.fila_pedidos[0] == pid
 					self.fila_pedidos.remove(pid)
+					deve_atender = era_primeiro
 				except ValueError:
 					pass
-				if self.processo_na_regiao_critica == pid:
-					self.processo_na_regiao_critica = None
 		try:
 			conexao.close()
 		except OSError:
 			pass
+		if deve_atender:
+			self._tentar_atender()
 
 	def _thread_processar_eventos(self) -> None:
 		while not self.stop_event.is_set():
@@ -153,57 +155,62 @@ class Coordenador:
 				self._processar_desconexao(evento.pid)
 
 	def _processar_request(self, pid: int, conexao: socket.socket) -> None:
+		deve_atender = False
 		with self.lock:
 			if pid not in self.sockets_por_pid:
 				self.sockets_por_pid[pid] = conexao
-			if pid not in self.fila_pedidos and self.processo_na_regiao_critica != pid:
+			if pid not in self.fila_pedidos:
 				self.fila_pedidos.append(pid)
-		self._tentar_atender()
+				deve_atender = len(self.fila_pedidos) == 1
+		if deve_atender:
+			self._tentar_atender()
 
 	def _processar_release(self, pid: int) -> None:
 		with self.lock:
-			if self.processo_na_regiao_critica != pid:
+			if not self.fila_pedidos or self.fila_pedidos[0] != pid:
 				return
-			self.processo_na_regiao_critica = None
+			self.fila_pedidos.popleft()
 		self._tentar_atender()
 
 	def _processar_desconexao(self, pid: int) -> None:
+		deve_atender = False
 		with self.lock:
 			self.sockets_por_pid.pop(pid, None)
 			try:
+				era_primeiro = bool(self.fila_pedidos) and self.fila_pedidos[0] == pid
 				self.fila_pedidos.remove(pid)
+				deve_atender = era_primeiro
 			except ValueError:
 				pass
-			if self.processo_na_regiao_critica == pid:
-				self.processo_na_regiao_critica = None
-		self._tentar_atender()
+		if deve_atender:
+			self._tentar_atender()
 
 	def _tentar_atender(self) -> None:
 		while not self.stop_event.is_set():
 			with self.lock:
-				if self.processo_na_regiao_critica is not None:
-					return
 				pid = self._proximo_pid_esperando()
 				if pid is None:
 					return
 				conexao = self.sockets_por_pid.get(pid)
 				if conexao is None:
 					continue
-				self.processo_na_regiao_critica = pid
 				self.quantidade_atendimentos[pid] = self.quantidade_atendimentos.get(pid, 0) + 1
 
 			if self._enviar(pid, GRANT):
 				return
 
 			with self.lock:
-				if self.processo_na_regiao_critica == pid:
-					self.processo_na_regiao_critica = None
+				try:
+					self.fila_pedidos.remove(pid)
+				except ValueError:
+					pass
 
 	def _proximo_pid_esperando(self) -> Optional[int]:
 		while self.fila_pedidos:
-			pid = self.fila_pedidos.popleft()
+			pid = self.fila_pedidos[0]
 			if pid in self.sockets_por_pid:
 				return pid
+			self.fila_pedidos.popleft()
 		return None
 
 	def _enviar(self, pid: int, tipo: int) -> bool:
@@ -216,7 +223,13 @@ class Coordenador:
 			self._log("ENVIADA", tipo, pid)
 			return True
 		except OSError:
-			self._processar_desconexao(pid)
+			with self.lock:
+				self.sockets_por_pid.pop(pid, None)
+				self.pid_por_socket.pop(conexao, None)
+			try:
+				conexao.close()
+			except OSError:
+				pass
 			return False
 
 	def _thread_comandos_terminal(self) -> None:
@@ -278,7 +291,6 @@ class Coordenador:
 			self.sockets_por_pid.clear()
 			self.pid_por_socket.clear()
 			self.fila_pedidos.clear()
-			self.processo_na_regiao_critica = None
 		for conexao in conexoes:
 			try:
 				conexao.close()
