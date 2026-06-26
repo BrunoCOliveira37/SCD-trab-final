@@ -3,23 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import queue
 import socket
 import threading
 from collections import deque
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Deque, Dict, Optional
 
 from protocolo import F, GRANT, REQUEST, RELEASE, criar_mensagem, interpretar_mensagem, nome_tipo, receber_exatamente
-
-
-@dataclass(frozen=True)
-class Evento:
-	tipo: int
-	pid: int
-	conexao: socket.socket
-
 
 class Coordenador:
 	def __init__(self, host: str, port: int, log_path: str = "coordenador.log") -> None:
@@ -27,7 +17,6 @@ class Coordenador:
 		self.port = port
 		self.log_path = log_path
 		self.stop_event = threading.Event()
-		self.eventos: "queue.Queue[Evento]" = queue.Queue()
 		self.lock = threading.Lock()
 		self.fila_pedidos: Deque[int] = deque()
 		self.sockets_por_pid: Dict[int, socket.socket] = {}
@@ -60,7 +49,6 @@ class Coordenador:
 
 	def _iniciar_threads(self) -> None:
 		self._adicionar_thread(self._thread_aceitar_conexoes, "aceitacao")
-		self._adicionar_thread(self._thread_processar_eventos, "algoritmo")
 		self._adicionar_thread(self._thread_comandos_terminal, "terminal")
 
 	def _adicionar_thread(self, alvo, nome: str) -> None:
@@ -99,26 +87,36 @@ class Coordenador:
 			self.threads.append(thread)
 
 	def _thread_receber_mensagens(self, conexao: socket.socket) -> None:
-		pid_conhecido: Optional[int] = None
 		try:
 			while not self.stop_event.is_set():
 				dados = receber_exatamente(conexao, F)
 				if len(dados) < F:
 					break
 				tipo, pid = interpretar_mensagem(dados)
-				pid_conhecido = pid
+				destino_grant = None
+
 				with self.lock:
 					self.sockets_por_pid[pid] = conexao
 					self.pid_por_socket[conexao] = pid
-				self._log("RECEBIDA", tipo, pid)
-				self.eventos.put(Evento(tipo=tipo, pid=pid, conexao=conexao))
-		except OSError:
-			pass
-		except ValueError:
+					self._log("RECEBIDA", tipo, pid)
+					if tipo == REQUEST:
+						if not self.fila_pedidos:
+							destino_grant = pid
+						if pid not in self.fila_pedidos:
+							self.fila_pedidos.append(pid)
+					elif tipo == RELEASE:
+						if self.fila_pedidos and self.fila_pedidos[0] == pid:
+							self.fila_pedidos.popleft()
+							if self.fila_pedidos:
+								destino_grant = self.fila_pedidos[0]
+				if destino_grant is not None:
+					self.quantidade_atendimentos[destino_grant] = (
+						self.quantidade_atendimentos.get(destino_grant, 0) + 1
+					)
+					self._enviar(destino_grant, GRANT)
+		except (OSError, ValueError):
 			pass
 		finally:
-			if pid_conhecido is not None:
-				self.eventos.put(Evento(tipo=0, pid=pid_conhecido, conexao=conexao))
 			self._remover_conexao(conexao)
 
 	def _remover_conexao(self, conexao: socket.socket) -> None:
@@ -137,81 +135,13 @@ class Coordenador:
 			conexao.close()
 		except OSError:
 			pass
+
 		if deve_atender:
-			self._tentar_atender()
-
-	def _thread_processar_eventos(self) -> None:
-		while not self.stop_event.is_set():
-			try:
-				evento = self.eventos.get(timeout=0.5)
-			except queue.Empty:
-				continue
-
-			if evento.tipo == REQUEST:
-				self._processar_request(evento.pid, evento.conexao)
-			elif evento.tipo == RELEASE:
-				self._processar_release(evento.pid)
-			else:
-				self._processar_desconexao(evento.pid)
-
-	def _processar_request(self, pid: int, conexao: socket.socket) -> None:
-		deve_atender = False
-		with self.lock:
-			if pid not in self.sockets_por_pid:
-				self.sockets_por_pid[pid] = conexao
-			if pid not in self.fila_pedidos:
-				self.fila_pedidos.append(pid)
-				deve_atender = len(self.fila_pedidos) == 1
-		if deve_atender:
-			self._tentar_atender()
-
-	def _processar_release(self, pid: int) -> None:
-		with self.lock:
-			if not self.fila_pedidos or self.fila_pedidos[0] != pid:
-				return
-			self.fila_pedidos.popleft()
-		self._tentar_atender()
-
-	def _processar_desconexao(self, pid: int) -> None:
-		deve_atender = False
-		with self.lock:
-			self.sockets_por_pid.pop(pid, None)
-			try:
-				era_primeiro = bool(self.fila_pedidos) and self.fila_pedidos[0] == pid
-				self.fila_pedidos.remove(pid)
-				deve_atender = era_primeiro
-			except ValueError:
-				pass
-		if deve_atender:
-			self._tentar_atender()
-
-	def _tentar_atender(self) -> None:
-		while not self.stop_event.is_set():
 			with self.lock:
-				pid = self._proximo_pid_esperando()
-				if pid is None:
-					return
-				conexao = self.sockets_por_pid.get(pid)
-				if conexao is None:
-					continue
-				self.quantidade_atendimentos[pid] = self.quantidade_atendimentos.get(pid, 0) + 1
+				proximo = self.fila_pedidos[0] if self.fila_pedidos else None
 
-			if self._enviar(pid, GRANT):
-				return
-
-			with self.lock:
-				try:
-					self.fila_pedidos.remove(pid)
-				except ValueError:
-					pass
-
-	def _proximo_pid_esperando(self) -> Optional[int]:
-		while self.fila_pedidos:
-			pid = self.fila_pedidos[0]
-			if pid in self.sockets_por_pid:
-				return pid
-			self.fila_pedidos.popleft()
-		return None
+			if proximo is not None:
+				self._enviar(proximo, GRANT)
 
 	def _enviar(self, pid: int, tipo: int) -> bool:
 		with self.lock:
@@ -301,7 +231,6 @@ class Coordenador:
 		except OSError:
 			pass
 
-
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Coordenador centralizado de exclusao mutua")
 	parser.add_argument("--host", default="127.0.0.1")
@@ -309,13 +238,11 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--log", default="coordenador.log")
 	return parser.parse_args()
 
-
 def main() -> int:
 	args = parse_args()
 	coordenador = Coordenador(args.host, args.port, args.log)
 	coordenador.iniciar()
 	return 0
-
 
 if __name__ == "__main__":
 	raise SystemExit(main())
